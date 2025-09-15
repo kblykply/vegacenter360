@@ -115,23 +115,28 @@ function createRenderer(
   T: ThreeNS,
   canvas: HTMLCanvasElement,
   gl: WebGLRenderingContext | WebGL2RenderingContext
-): ThreeNS["WebGLRenderer"] {
+): import("three").WebGLRenderer {
   // Try the standard renderer first
   try {
     return new T.WebGLRenderer({ canvas, context: gl });
   } catch {
-    // Optional runtime fallback for older three builds that still ship WebGL1Renderer
-    const maybe = (T as unknown as Record<string, unknown>)["WebGL1Renderer"] as unknown;
+    // Optional runtime fallback for older builds that still expose WebGL1Renderer.
+    // We keep this fully typed by using `unknown` (no `any`) and asserting to the instance type.
+    const maybe = (T as unknown as Record<string, unknown>)["WebGL1Renderer"];
     if (typeof maybe === "function") {
-      const WebGL1Ctor = maybe as new (params: {
+      type Ctor = new (params: {
         canvas: HTMLCanvasElement;
         context: WebGLRenderingContext | WebGL2RenderingContext;
-      }) => ThreeNS["WebGLRenderer"];
-      return new WebGL1Ctor({ canvas, context: gl });
+      }) => unknown; // constructor returns unknown
+
+      const WebGL1Ctor = maybe as Ctor;
+      const inst = new WebGL1Ctor({ canvas, context: gl });
+      return inst as import("three").WebGLRenderer; // assert to instance type
     }
     throw new Error("WebGL renderer could not be created.");
   }
 }
+
 
 
 type LoseContextExtension = { loseContext: () => void };
@@ -260,10 +265,10 @@ export function PanoViewer({
     let mounted = true;
 
     // three.js objects
-    let renderer:
-      | ThreeNS["WebGLRenderer"]
-      | ThreeNS["WebGL1Renderer"]
-      | null = null;
+let renderer: import("three").WebGLRenderer | null = null;
+
+
+
     let gl: WebGLRenderingContext | WebGL2RenderingContext | null = null;
     let scene: import("three").Scene | null = null;
     let camera: import("three").PerspectiveCamera | null = null;
