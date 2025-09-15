@@ -87,17 +87,29 @@ export type PanoTourProps = {
 /* -----------------------------------------------------------
    GL Helpers (typed)
 ----------------------------------------------------------- */
-function getWebGLContext(attrs: WebGLContextAttributes): {
+function getWebGLContext(
+  attrs: WebGLContextAttributes
+): {
   canvas: HTMLCanvasElement;
   gl: WebGLRenderingContext | WebGL2RenderingContext | null;
 } {
   const canvas = document.createElement("canvas");
-  const tryCtx = (name: "webgl2" | "webgl" | "experimental-webgl") =>
-    canvas.getContext(name, attrs);
+
+  // Narrow each getContext call to a WebGL context type
+  const get = <
+    T extends WebGLRenderingContext | WebGL2RenderingContext
+  >(
+    name: "webgl2" | "webgl" | "experimental-webgl"
+  ): T | null => canvas.getContext(name, attrs) as unknown as T | null;
+
   const gl =
-    tryCtx("webgl2") || tryCtx("webgl") || tryCtx("experimental-webgl");
+    get<WebGL2RenderingContext>("webgl2") ??
+    get<WebGLRenderingContext>("webgl") ??
+    get<WebGLRenderingContext>("experimental-webgl");
+
   return { canvas, gl };
 }
+
 
 function createRenderer(
   T: ThreeNS,
