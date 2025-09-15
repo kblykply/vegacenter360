@@ -115,13 +115,24 @@ function createRenderer(
   T: ThreeNS,
   canvas: HTMLCanvasElement,
   gl: WebGLRenderingContext | WebGL2RenderingContext
-): ThreeNS["WebGLRenderer"] | ThreeNS["WebGL1Renderer"] {
+): ThreeNS["WebGLRenderer"] {
+  // Try the standard renderer first
   try {
     return new T.WebGLRenderer({ canvas, context: gl });
   } catch {
-    return new T.WebGL1Renderer({ canvas, context: gl });
+    // Optional runtime fallback for older three builds that still ship WebGL1Renderer
+    const maybe = (T as unknown as Record<string, unknown>)["WebGL1Renderer"] as unknown;
+    if (typeof maybe === "function") {
+      const WebGL1Ctor = maybe as new (params: {
+        canvas: HTMLCanvasElement;
+        context: WebGLRenderingContext | WebGL2RenderingContext;
+      }) => ThreeNS["WebGLRenderer"];
+      return new WebGL1Ctor({ canvas, context: gl });
+    }
+    throw new Error("WebGL renderer could not be created.");
   }
 }
+
 
 type LoseContextExtension = { loseContext: () => void };
 
