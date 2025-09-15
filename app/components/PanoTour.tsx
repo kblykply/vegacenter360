@@ -1,20 +1,41 @@
-// app/components/PanoTour.tsx
 /* eslint-disable @next/next/no-img-element */
+// app/components/PanoTour.tsx
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /* -----------------------------------------------------------
-   Dynamically load three.js (Next.js SSR-safe)
+   Dynamically load three.js (Next.js SSR-safe) with types
 ----------------------------------------------------------- */
-let THREE: typeof import("three") | null = null;
-let OrbitControls: any = null;
+type ThreeNS = typeof import("three");
+type OrbitControlsModule = typeof import("three/examples/jsm/controls/OrbitControls.js");
+type OrbitControlsCtor = OrbitControlsModule["OrbitControls"];
+
+// minimal interface we use at runtime (avoids importing types eagerly)
+interface IOrbitControls {
+  enableDamping: boolean;
+  enableZoom: boolean;
+  enablePan: boolean;
+  rotateSpeed: number;
+  zoomSpeed: number;
+  minDistance: number;
+  maxDistance: number;
+  update(): void;
+  dispose(): void;
+}
+
+let THREE: ThreeNS | null = null;
+let OrbitControlsClass: OrbitControlsCtor | null = null;
 
 async function ensureThree() {
   if (!THREE) {
     THREE = await import("three");
-    const mod = await import("three/examples/jsm/controls/OrbitControls.js");
-    OrbitControls = mod.OrbitControls;
+  }
+  if (!OrbitControlsClass) {
+    const mod: OrbitControlsModule = await import(
+      "three/examples/jsm/controls/OrbitControls.js"
+    );
+    OrbitControlsClass = mod.OrbitControls;
   }
 }
 
@@ -23,8 +44,8 @@ async function ensureThree() {
 ----------------------------------------------------------- */
 export type SceneLink = {
   to: string;
-  yaw: number;   // +right / -left (deg)
-  pitch: number; // +down / -up  (deg) [UI convention]
+  yaw: number; // +right / -left (deg)
+  pitch: number; // +down / -up (deg) [UI convention]
   label?: string;
 };
 
@@ -45,10 +66,10 @@ export type Pin = {
 export type Scene = {
   id: string;
   title?: string;
-  src: string;     // equirect pano under /public
+  src: string; // equirect pano under /public
   yaw?: number;
   links?: SceneLink[];
-  pins?: Pin[];    // Only add pins to scenes that should have them
+  pins?: Pin[]; // only scenes that have pins will render them
 };
 
 export type PanoTourProps = {
@@ -56,49 +77,74 @@ export type PanoTourProps = {
   startId: string;
   autoRotateSpeed?: number;
   zoom?: boolean;
-  /** Logos shown at the top-left (project first) */
+  /** Logos shown in the top bar (project first) */
   projectLogoSrc?: string;
   companyLogoSrc?: string;
   projectLogoAlt?: string;
   companyLogoAlt?: string;
 };
 
-/* ===========================================================
-   Helpers
-=========================================================== */
-function getWebGLContext(attrs: WebGLContextAttributes) {
+/* -----------------------------------------------------------
+   GL Helpers (typed)
+----------------------------------------------------------- */
+function getWebGLContext(attrs: WebGLContextAttributes): {
+  canvas: HTMLCanvasElement;
+  gl: WebGLRenderingContext | WebGL2RenderingContext | null;
+} {
   const canvas = document.createElement("canvas");
-  let gl =
-    (canvas.getContext("webgl2", attrs as any) as any) ||
-    (canvas.getContext("webgl", attrs as any) as any) ||
-    null;
+  const tryCtx = (name: "webgl2" | "webgl" | "experimental-webgl") =>
+    canvas.getContext(name, attrs);
+  const gl =
+    tryCtx("webgl2") || tryCtx("webgl") || tryCtx("experimental-webgl");
   return { canvas, gl };
 }
 
-async function loadTextureSmart(url: string, maxWidth = 8192) {
-  await ensureThree();
+function createRenderer(
+  T: ThreeNS,
+  canvas: HTMLCanvasElement,
+  gl: WebGLRenderingContext | WebGL2RenderingContext
+): ThreeNS["WebGLRenderer"] | ThreeNS["WebGL1Renderer"] {
+  try {
+    return new T.WebGLRenderer({ canvas, context: gl });
+  } catch {
+    return new T.WebGL1Renderer({ canvas, context: gl });
+  }
+}
 
-  // Build an absolute URL (handles basePath)
+type LoseContextExtension = { loseContext: () => void };
+
+/* -----------------------------------------------------------
+   Image loader (typed, no `any`)
+----------------------------------------------------------- */
+async function loadTextureSmart(
+  url: string,
+  maxWidth = 8192
+): Promise<import("three").CanvasTexture> {
+  await ensureThree();
+  const T = THREE!;
+
+  // absolute URL (handles basePath)
   const absolute = url.startsWith("http")
     ? url
     : new URL(url, window.location.origin).toString();
 
   let blob: Blob | null = null;
 
-  // Fetch first so we surface HTTP errors (404/403/etc.)
+  // Fetch first so we can surface HTTP errors
   try {
     const res = await fetch(absolute, { cache: "force-cache" });
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} for ${absolute}`);
+    if (!res.ok)
+      throw new Error(`HTTP ${res.status} ${res.statusText} for ${absolute}`);
     blob = await res.blob();
-  } catch (e) {
-    console.warn("fetch() failed, falling back to <img> decode:", e);
+  } catch {
+    // fall through to <img> path
   }
 
   const makeTextureFromCanvas = (canvas: HTMLCanvasElement) => {
-    const tex = new (THREE as any).CanvasTexture(canvas);
-    tex.colorSpace = (THREE as any).SRGBColorSpace;
-    tex.minFilter = (THREE as any).LinearMipmapLinearFilter;
-    tex.magFilter = (THREE as any).LinearFilter;
+    const tex = new T.CanvasTexture(canvas);
+    tex.colorSpace = T.SRGBColorSpace;
+    tex.minFilter = T.LinearMipmapLinearFilter;
+    tex.magFilter = T.LinearFilter;
     tex.generateMipmaps = true;
     return tex;
   };
@@ -118,10 +164,10 @@ async function loadTextureSmart(url: string, maxWidth = 8192) {
       off.height = sh;
       const ctx = off.getContext("2d")!;
       ctx.drawImage(bmp, 0, 0, sw, sh);
-      bmp.close?.();
+      bmp.close();
       return makeTextureFromCanvas(off);
-    } catch (e) {
-      console.warn("createImageBitmap failed, falling back to <img>:", e);
+    } catch {
+      // fall back
     }
   }
 
@@ -132,7 +178,8 @@ async function loadTextureSmart(url: string, maxWidth = 8192) {
 
   await new Promise<void>((resolve, reject) => {
     img.onload = () => resolve();
-    img.onerror = () => reject(new Error(`Image decode failed for ${absolute}`));
+    img.onerror = () =>
+      reject(new Error(`Image decode failed for ${absolute}`));
   });
 
   try {
@@ -149,12 +196,9 @@ async function loadTextureSmart(url: string, maxWidth = 8192) {
     ctx.drawImage(img, 0, 0, sw, sh);
     return makeTextureFromCanvas(off);
   } finally {
-    // Clean up object URL if we created one
     if (blob) URL.revokeObjectURL(img.src);
   }
 }
-
-
 
 /* ===========================================================
    PanoViewer (single panorama, fills its parent)
@@ -173,7 +217,7 @@ export function PanoViewer({
   pins = [],
   autoRotateSpeed = 0,
   zoom = true,
-  debug = true,               // Alt+Click to log yaw/pitch
+  debug = true,
   className = "absolute inset-0",
 }: {
   src: string;
@@ -193,27 +237,31 @@ export function PanoViewer({
     let mounted = true;
 
     // three.js objects
-    let renderer: any;
+    let renderer:
+      | ThreeNS["WebGLRenderer"]
+      | ThreeNS["WebGL1Renderer"]
+      | null = null;
     let gl: WebGLRenderingContext | WebGL2RenderingContext | null = null;
-    let scene: any;
-    let camera: any;
-    let controls: any;
-    let sphere: any;
-    let geometry: any;
-    let material: any;
-    let texture: any;
+    let scene: import("three").Scene | null = null;
+    let camera: import("three").PerspectiveCamera | null = null;
+    let controls: IOrbitControls | null = null;
+    let sphere: import("three").Mesh | null = null;
+    let geometry: import("three").SphereGeometry | null = null;
+    let material: import("three").MeshBasicMaterial | null = null;
+    let texture: import("three").Texture | null = null;
     let animId = 0;
 
     const pinWraps: HTMLDivElement[] = [];
     const hotspotEls: HTMLDivElement[] = [];
 
     const toVec3 = (yawDeg: number, pitchDeg: number) => {
+      const T = THREE!;
       const yawR = (yawDeg * Math.PI) / 180;
       const pitchR = (pitchDeg * Math.PI) / 180;
       const x = Math.cos(pitchR) * Math.sin(yawR);
       const y = Math.sin(pitchR);
       const z = Math.cos(pitchR) * Math.cos(yawR);
-      return new (THREE as any).Vector3(x, y, z).multiplyScalar(49.9);
+      return new T.Vector3(x, y, z).multiplyScalar(49.9);
     };
 
     // for debug: compute yaw/pitch from mouse
@@ -222,13 +270,14 @@ export function PanoViewer({
       const rect = renderer.domElement.getBoundingClientRect();
       const x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
       const y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
-      const v = new (THREE as any).Vector3(x, y, 0.5)
+      const T = THREE!;
+      const v = new T.Vector3(x, y, 0.5)
         .unproject(camera)
         .sub(camera.position)
         .normalize();
       const yawD = (Math.atan2(v.x, v.z) * 180) / Math.PI;
       const pitchD = (Math.asin(v.y) * 180) / Math.PI; // +up
-      return { yaw: yawD, pitch: -pitchD };            // UI uses +down
+      return { yaw: yawD, pitch: -pitchD }; // UI uses +down
     };
 
     let cleanup = () => {};
@@ -236,6 +285,7 @@ export function PanoViewer({
     (async () => {
       await ensureThree();
       if (!mounted || !THREE || !containerRef.current) return;
+      const T = THREE!;
 
       const el = containerRef.current;
       const size = () => [el.clientWidth, el.clientHeight] as const;
@@ -246,7 +296,7 @@ export function PanoViewer({
         antialias: false,
         depth: true,
         stencil: false,
-        desynchronized: true as any,
+        desynchronized: true as unknown as boolean, // flag varies
         powerPreference: "high-performance",
         preserveDrawingBuffer: false,
       };
@@ -257,12 +307,11 @@ export function PanoViewer({
         setError(
           "WebGL is unavailable. Close other GPU-heavy tabs, enable hardware acceleration, or reduce image size."
         );
-        console.error("No WebGL context. Browser blocked or GPU not available.");
         return;
       }
 
       // --- Renderer from that context ---
-      renderer = new (THREE as any).WebGLRenderer({ canvas, context: gl as any });
+      renderer = createRenderer(T, canvas, gl);
       renderer.setClearColor(0x000000, 1);
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.75));
       const [w0, h0] = size();
@@ -273,18 +322,18 @@ export function PanoViewer({
         "webglcontextlost",
         (ev: Event) => {
           ev.preventDefault();
-          console.warn("WebGL context lost.");
           setError("Graphics context lost. Reload the page.");
         },
         false
       );
 
       // --- Scene / Camera / Controls ---
-      scene = new (THREE as any).Scene();
-      camera = new (THREE as any).PerspectiveCamera(75, w0 / h0, 0.1, 1000);
+      scene = new T.Scene();
+      camera = new T.PerspectiveCamera(75, w0 / h0, 0.1, 1000);
       camera.position.set(0, 0, 0.1);
 
-      controls = new (OrbitControls as any)(camera, renderer.domElement);
+      const Controls = OrbitControlsClass!;
+      controls = new Controls(camera, renderer.domElement) as unknown as IOrbitControls;
       controls.enableDamping = true;
       controls.enableZoom = zoom;
       controls.enablePan = false;
@@ -296,22 +345,23 @@ export function PanoViewer({
       // --- Texture (downscale big 12k images to <= 8k) ---
       try {
         texture = await loadTextureSmart(src, 8192);
-      }  catch (e: any) {
-  console.error("Failed to load pano", src, e);
-  setError(String(e?.message || e) || "Failed to load image.");
-  return;
-}
+      } catch (e: unknown) {
+        const msg =
+          e instanceof Error ? e.message : "Failed to load image.";
+        setError(msg);
+        return;
+      }
 
-      geometry = new (THREE as any).SphereGeometry(50, 64, 48);
+      geometry = new T.SphereGeometry(50, 64, 48);
       geometry.scale(-1, 1, 1);
-      material = new (THREE as any).MeshBasicMaterial({ map: texture });
-      sphere = new (THREE as any).Mesh(geometry, material);
+      material = new T.MeshBasicMaterial({ map: texture });
+      sphere = new T.Mesh(geometry, material);
       scene.add(sphere);
 
       // initial yaw
       camera.rotation.y = -(yaw * Math.PI) / 180;
 
-      // --- Hotspots (scene links; optional) ---
+      // --- Hotspots (scene links) ---
       hotspots.forEach((h) => {
         const d = document.createElement("div");
         d.className =
@@ -328,7 +378,8 @@ export function PanoViewer({
       // --- Pins with info cards ---
       pins.forEach((p) => {
         const wrap = document.createElement("div");
-        wrap.className = "absolute -translate-x-1/2 -translate-y-1/2 pointer-events-auto group";
+        wrap.className =
+          "absolute -translate-x-1/2 -translate-y-1/2 pointer-events-auto group";
 
         const btn = document.createElement("button");
         btn.className =
@@ -371,7 +422,8 @@ export function PanoViewer({
                     ? `<div class="mt-2 flex gap-2 flex-wrap">
                         ${p.links
                           .map(
-                            (l) => `<a href="${l.href}" target="_blank" class="inline-flex items-center text-xs px-2 py-1 rounded bg-white text-black hover:bg-white/90">${l.text}</a>`
+                            (l) =>
+                              `<a href="${l.href}" target="_blank" class="inline-flex items-center text-xs px-2 py-1 rounded bg-white text-black hover:bg-white/90">${l.text}</a>`
                           )
                           .join("")}
                        </div>`
@@ -386,8 +438,14 @@ export function PanoViewer({
 
         // hover & tap
         let open = false;
-        const openCard = () => { open = true; wrap.classList.add("open"); };
-        const closeCard = () => { open = false; wrap.classList.remove("open"); };
+        const openCard = () => {
+          open = true;
+          wrap.classList.add("open");
+        };
+        const closeCard = () => {
+          open = false;
+          wrap.classList.remove("open");
+        };
         btn.addEventListener("mouseenter", openCard);
         wrap.addEventListener("mouseleave", closeCard);
         btn.addEventListener("click", () => (open ? closeCard() : openCard()));
@@ -396,23 +454,23 @@ export function PanoViewer({
         pinWraps.push(wrap);
       });
 
-      // --- loop ---
-      const clock = new (THREE as any).Clock();
+      // --- render loop ---
+      const clock = new T.Clock();
       const loop = () => {
         animId = requestAnimationFrame(loop);
         const dt = clock.getDelta();
-        if (autoRotateSpeed) {
+        if (autoRotateSpeed && sphere) {
           sphere.rotation.y += ((autoRotateSpeed * Math.PI) / 180) * dt;
         }
-        controls.update();
-        renderer.render(scene, camera);
+        controls?.update();
+        if (scene && camera && renderer) renderer.render(scene, camera);
 
         const w = el.clientWidth;
         const h = el.clientHeight;
 
         hotspots.forEach((hs, i) => {
           const p3 = toVec3(hs.yaw, -hs.pitch);
-          p3.project(camera);
+          p3.project(camera!);
           const visible = p3.z < 1;
           const x = (p3.x * 0.5 + 0.5) * w;
           const y = (-p3.y * 0.5 + 0.5) * h;
@@ -423,7 +481,7 @@ export function PanoViewer({
 
         pins.forEach((pin, i) => {
           const p3 = toVec3(pin.yaw, -pin.pitch);
-          p3.project(camera);
+          p3.project(camera!);
           const visible = p3.z < 1;
           const x = (p3.x * 0.5 + 0.5) * w;
           const y = (-p3.y * 0.5 + 0.5) * h;
@@ -437,9 +495,11 @@ export function PanoViewer({
       const onResize = () => {
         const nw = el.clientWidth;
         const nh = el.clientHeight;
-        renderer.setSize(nw, nh);
-        camera.aspect = nw / nh;
-        camera.updateProjectionMatrix();
+        renderer!.setSize(nw, nh);
+        if (camera) {
+          camera.aspect = nw / nh;
+          camera.updateProjectionMatrix();
+        }
       };
       window.addEventListener("resize", onResize);
 
@@ -447,22 +507,19 @@ export function PanoViewer({
       const onAltClick = (e: MouseEvent) => {
         if (!debug || !e.altKey) return;
         const a = getYawPitchFromPointer(e);
-        console.log(
-          "%cPin draft:",
-          "background:#222;color:#0f0;padding:2px 6px;border-radius:4px",
-          {
-            id: `pin_${Date.now()}`,
-            yaw: Number(a.yaw.toFixed(2)),
-            pitch: Number(a.pitch.toFixed(2)),
-            title: "New place",
-            description: "Describe...",
-            image: "/pins/example.jpg",
-            distanceMinutes: 5,
-            label: "Label",
-            badge: "Type",
-            links: [{ href: "https://example.com", text: "More" }],
-          }
-        );
+        // eslint-disable-next-line no-console
+        console.log("Pin draft:", {
+          id: `pin_${Date.now()}`,
+          yaw: Number(a.yaw.toFixed(2)),
+          pitch: Number(a.pitch.toFixed(2)),
+          title: "New place",
+          description: "Describe...",
+          image: "/pins/example.jpg",
+          distanceMinutes: 5,
+          label: "Label",
+          badge: "Type",
+          links: [{ href: "https://example.com", text: "More" }],
+        });
       };
       el.addEventListener("click", onAltClick);
 
@@ -479,22 +536,24 @@ export function PanoViewer({
         pinWraps.forEach((d) => d.remove());
 
         try {
-          const ext: any =
-            gl && (gl as any).getExtension?.("WEBGL_lose_context");
-          // @ts-ignore
-          ext?.loseContext?.();
-        } catch {}
-        try {
-          renderer?.dispose?.();
-          if (renderer?.domElement && renderer.domElement.parentElement === el) {
-            el.removeChild(renderer.domElement);
+          if (gl && "getExtension" in gl) {
+            const ext = (gl as WebGLRenderingContext).getExtension(
+              "WEBGL_lose_context"
+            ) as LoseContextExtension | null;
+            ext?.loseContext();
           }
-        } catch {}
-        try {
-          geometry?.dispose?.();
-          material?.dispose?.();
-          texture?.dispose?.();
-        } catch {}
+        } catch {
+          /* ignore */
+        }
+
+        controls?.dispose();
+        if (renderer && renderer.domElement.parentElement === el) {
+          el.removeChild(renderer.domElement);
+        }
+        geometry?.dispose();
+        material?.dispose();
+        texture?.dispose();
+        renderer?.dispose?.();
       };
     })();
 
@@ -544,7 +603,7 @@ export default function PanoTour({
   const byId = useMemo(
     () => Object.fromEntries(scenes.map((s) => [s.id, s])),
     [scenes]
-  );
+  ) as Record<string, Scene>;
   const [currentId, setCurrentId] = useState(startId);
   const [autoSpin, setAutoSpin] = useState<boolean>(true);
   const current = byId[currentId];
@@ -589,7 +648,7 @@ export default function PanoTour({
         src={current.src}
         yaw={current.yaw || 0}
         hotspots={hotspots}
-        pins={current.pins || []}   // ← only scenes with pins will show them
+        pins={current.pins || []}
         autoRotateSpeed={autoSpin ? autoRotateSpeed : 0}
         zoom={zoom}
         className="absolute inset-0"
@@ -597,14 +656,22 @@ export default function PanoTour({
 
       {/* ======= GLASS UI OVERLAYS ======= */}
 
-      {/* Top bar with logos (project first, then company) */}
+      {/* Top bar with logos */}
       <div className="pointer-events-none absolute left-0 right-0 top-0 p-3">
         <div className="mx-auto max-w-[min(1280px,100vw)] pointer-events-auto rounded-2xl bg-white/10 border border-white/20 backdrop-blur-xl text-white shadow-[0_12px_40px_rgba(0,0,0,.25)]">
           <div className="flex items-center justify-between gap-3 px-4 py-3">
             <div className="flex items-center gap-4 min-w-0">
-              <img src={projectLogoSrc} alt={projectLogoAlt} className="h-8 w-auto object-contain" />
+              <img
+                src={projectLogoSrc}
+                alt={projectLogoAlt}
+                className="h-8 w-auto object-contain"
+              />
               <div className="h-6 w-px bg-white/30" />
-              <img src={companyLogoSrc} alt={companyLogoAlt} className="h-8 w-auto object-contain" />
+              <img
+                src={companyLogoSrc}
+                alt={companyLogoAlt}
+                className="h-8 w-auto object-contain"
+              />
               <div className="ml-4">
                 <div className="text-[11px] uppercase tracking-wider text-white/70">
                   Panorama Tour
@@ -617,7 +684,7 @@ export default function PanoTour({
 
             {/* scene chips */}
             <div className="hidden md:flex flex-wrap gap-2">
-              {Object.values(byId).map((s) => (
+              {scenes.map((s) => (
                 <button
                   key={s.id}
                   onClick={() => setCurrentId(s.id)}
@@ -667,7 +734,7 @@ export default function PanoTour({
           {/* Thumbs strip */}
           <div className="rounded-2xl border border-white/20 bg-white/10 backdrop-blur-xl px-2 py-2">
             <div className="flex gap-2 overflow-x-auto">
-              {Object.values(byId).map((s) => (
+              {scenes.map((s) => (
                 <button
                   key={s.id}
                   onClick={() => setCurrentId(s.id)}
@@ -678,7 +745,11 @@ export default function PanoTour({
                   }`}
                   title={s.title || s.id}
                 >
-                  <img src={s.src} alt={s.id} className="w-full h-full object-cover" />
+                  <img
+                    src={s.src}
+                    alt={s.id}
+                    className="w-full h-full object-cover"
+                  />
                 </button>
               ))}
             </div>
