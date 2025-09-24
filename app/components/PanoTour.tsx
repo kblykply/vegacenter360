@@ -89,13 +89,8 @@ export default function Pano360({
   const overlayTexturesRef = useRef<Map<string, THREE.Texture>>(new Map());
   const loadingManagerRef = useRef<THREE.LoadingManager | null>(null);
   const overlayLoaderRef = useRef<THREE.TextureLoader | null>(null);
-  const pinRefs = useRef<Record<string, HTMLButtonElement>>({});
+  const pinRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const filteredPinsRef = useRef<Pin[]>([]);
-
-  // NEW: preload states
-  const [progress, setProgress] = useState(0);
-  const [isLoaded, setIsLoaded] = useState(false);
-  const panoTextureRef = useRef<THREE.Texture | null>(null);
 
   const [enabledCats, setEnabledCats] = useState<Set<string>>(
     () => new Set(categories.map((c) => c.id))
@@ -113,99 +108,7 @@ export default function Pano360({
     filteredPinsRef.current = filteredPins;
   }, [filteredPins]);
 
-  // =====================
-  // PRELOAD ALL ASSETS (panorama, overlay textures, card images) WITH PROGRESS
-  // — ensures *all* images referenced in examplePins are downloaded (deduped)
-  // =====================
   useEffect(() => {
-    let cancelled = false;
-
-    // Reset
-    setProgress(0);
-    setIsLoaded(false);
-    panoTextureRef.current = null;
-    overlayTexturesRef.current.clear();
-
-    const manager = new THREE.LoadingManager();
-    loadingManagerRef.current = manager;
-
-    // Collect and de-duplicate ALL URLs used by pins
-    const overlaySet = new Set<string>();
-    const cardSet = new Set<string>();
-
-    pins.forEach(p => {
-      if (p.hoverOverlayPng) overlaySet.add(p.hoverOverlayPng);
-      if (p.cardImage) cardSet.add(p.cardImage);
-    });
-
-    // Build the total item set (panorama + overlays + card images)
-    const totalItems: Set<string> = new Set([panoramaSrc, ...overlaySet, ...cardSet]);
-
-    manager.onProgress = (_url, itemsLoaded, itemsTotal) => {
-      const pct = Math.round((itemsLoaded / Math.max(itemsTotal, 1)) * 100);
-      setProgress(pct);
-    };
-
-    manager.onLoad = () => {
-      if (!cancelled) setIsLoaded(true);
-    };
-
-    const texLoader = new THREE.TextureLoader(manager);
-
-    // 1) Preload panorama
-    texLoader.load(
-      panoramaSrc,
-      (t) => {
-        if (cancelled) { t.dispose(); return; }
-        t.colorSpace = THREE.SRGBColorSpace;
-        panoTextureRef.current = t;
-      },
-      undefined,
-      () => { /* ignore errors; manager still settles */ }
-    );
-
-    // 2) Preload ALL unique overlay textures
-    overlaySet.forEach(url => {
-      if (overlayTexturesRef.current.has(url)) return;
-      texLoader.load(
-        url,
-        (t) => {
-          if (cancelled) { t.dispose(); return; }
-          t.colorSpace = THREE.SRGBColorSpace;
-          t.generateMipmaps = false;
-          t.minFilter = THREE.LinearFilter;
-          t.magFilter = THREE.LinearFilter;
-          overlayTexturesRef.current.set(url, t);
-        },
-        undefined,
-        () => { /* ignore */ }
-      );
-    });
-
-    // 3) Preload ALL unique card images and force DECODE to avoid first-use jank
-    cardSet.forEach(url => {
-      manager.itemStart(url);
-      const img = new Image();
-      img.src = url;
-      // Prefer decode() if supported to force raster decode before first paint
-      if (typeof (img as any).decode === 'function') {
-        (img as any).decode().catch(() => {/* ignore */}).finally(() => manager.itemEnd(url));
-      } else {
-        img.onload = () => manager.itemEnd(url);
-        img.onerror = () => manager.itemEnd(url);
-      }
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [panoramaSrc, pins]);
-
-  // =====================
-  // SCENE SETUP (waits until isLoaded)
-  // =====================
-  useEffect(() => {
-    if (!isLoaded) return;
     if (!mountRef.current) return;
 
     const scene = new THREE.Scene();
@@ -230,45 +133,22 @@ export default function Pano360({
     controls.dampingFactor = 0.06;
     controls.enablePan = false;
     controls.autoRotate = autoRotate;
-    controls.autoRotateSpeed = Math.max(0, Math.min(rotationSpeed, 1));
+    controls.autoRotateSpeed = rotationSpeed;
 
     const radius = 500;
     const geo = new THREE.SphereGeometry(radius, 64, 64);
-    const panoTex = panoTextureRef.current ?? new THREE.TextureLoader().load(panoramaSrc);
-    panoTex.colorSpace = THREE.SRGBColorSpace;
-    const mat = new THREE.MeshBasicMaterial({ map: panoTex, side: THREE.BackSide });
+    const tex = new THREE.TextureLoader().load(panoramaSrc);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    const mat = new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide });
     const sphere = new THREE.Mesh(geo, mat);
     scene.add(sphere);
 
     const overlayGeo = new THREE.SphereGeometry(radius - 1, 64, 64);
-    const placeholder = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1, THREE.RGBAFormat);
-    placeholder.colorSpace = THREE.SRGBColorSpace;
-    placeholder.needsUpdate = true;
-    const overlayMat = new THREE.MeshBasicMaterial({ map: placeholder, transparent: true, opacity: 0, side: THREE.BackSide, depthWrite: false });
+    const overlayMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, side: THREE.BackSide, depthWrite: false });
     const overlaySphere = new THREE.Mesh(overlayGeo, overlayMat);
     overlaySphere.visible = false;
     overlaySphereRef.current = overlaySphere;
     scene.add(overlaySphere);
-
-    // -------- GPU WARM-UP for overlay textures to avoid first-hover upload stutter --------
-    try {
-      const caps = renderer.capabilities as any;
-      const maxAniso = (caps.getMaxAnisotropy ? caps.getMaxAnisotropy() : 0) || 0;
-      overlayTexturesRef.current.forEach((tex) => {
-        tex.anisotropy = Math.min(4, maxAniso);
-      });
-      // Render one frame per cached overlay texture with opacity 0 to force GPU upload
-      const originalMap = (overlaySphere.material as THREE.MeshBasicMaterial).map;
-      const originalOpacity = (overlaySphere.material as THREE.MeshBasicMaterial).opacity;
-      (overlaySphere.material as THREE.MeshBasicMaterial).opacity = 0;
-      overlayTexturesRef.current.forEach((tex) => {
-        (overlaySphere.material as THREE.MeshBasicMaterial).map = tex;
-        (overlaySphere.material as THREE.MeshBasicMaterial).needsUpdate = true;
-        renderer.render(scene, camera);
-      });
-      (overlaySphere.material as THREE.MeshBasicMaterial).map = originalMap;
-      (overlaySphere.material as THREE.MeshBasicMaterial).opacity = originalOpacity;
-    } catch { /* safe no-op */ }
 
     controls.target.set(0, 0, 0);
     const dir = yawPitchToVector3(initialYaw, initialPitch, 1).normalize();
@@ -287,11 +167,6 @@ export default function Pano360({
     onResize();
     const resizeObserver = new ResizeObserver(onResize);
     resizeObserver.observe(mount);
-
-    const pause = () => (controls.autoRotate = false);
-    const resume = () => (controls.autoRotate = autoRotate);
-    mount.addEventListener("pointerenter", pause);
-    mount.addEventListener("pointerleave", resume);
 
     const updatePinPositions = () => {
       const width = mount.clientWidth;
@@ -318,7 +193,7 @@ export default function Pano360({
       if (stopped) return;
       rafId = requestAnimationFrame(animate);
       controls.autoRotate = autoRotate;
-      controls.autoRotateSpeed = Math.max(0, Math.min(rotationSpeed, 1));
+      controls.autoRotateSpeed = rotationSpeed;
       controls.update();
       renderer.render(scene, camera);
       updatePinPositions();
@@ -333,32 +208,35 @@ export default function Pano360({
     return () => {
       controls.removeEventListener("start", onStart);
       controls.removeEventListener("end", onEnd);
-      mount.removeEventListener("pointerenter", pause);
-      mount.removeEventListener("pointerleave", resume);
       resizeObserver.disconnect();
       stopped = true;
       cancelAnimationFrame(rafId);
       renderer.dispose();
       geo.dispose();
       mat.dispose();
-      // Do NOT dispose panoTex here if you plan to reuse across mounts. If desired, uncomment next line.
-      // panoTex.dispose();
+      tex.dispose();
       overlayGeo.dispose();
       const m = overlaySphere.material as THREE.MeshBasicMaterial;
-      if (m.map && m.map !== placeholder) m.map.dispose();
+      if (m.map) m.map.dispose();
       m.dispose();
-      placeholder.dispose();
     };
-  }, [isLoaded, panoramaSrc, initialYaw, initialPitch, initialFov, autoRotate, rotationSpeed]);
+  }, [panoramaSrc, initialYaw, initialPitch, initialFov, autoRotate, rotationSpeed]);
 
-  // Keep TextureLoader ready for on-hover fallback (though most are preloaded)
   useEffect(() => {
     THREE.Cache.enabled = true;
     if (!loadingManagerRef.current) loadingManagerRef.current = new THREE.LoadingManager();
     if (!overlayLoaderRef.current) overlayLoaderRef.current = new THREE.TextureLoader(loadingManagerRef.current);
-  }, []);
+    const loader = overlayLoaderRef.current;
+    pins.forEach((p) => {
+      if (!p.hoverOverlayPng) return;
+      if (overlayTexturesRef.current.has(p.hoverOverlayPng)) return;
+      const t = loader.load(p.hoverOverlayPng);
+      t.colorSpace = THREE.SRGBColorSpace;
+      overlayTexturesRef.current.set(p.hoverOverlayPng, t);
+    });
+    return () => {};
+  }, [pins]);
 
-  // Swap overlay on hover (prefers cache from preload)
   useEffect(() => {
     const overlaySphere = overlaySphereRef.current;
     if (!overlaySphere) return;
@@ -369,21 +247,15 @@ export default function Pano360({
       return;
     }
 
-    const cached = overlayTexturesRef.current.get(hoveredPin.hoverOverlayPng);
-    if (cached) {
-      cached.generateMipmaps = false;
-      cached.minFilter = THREE.LinearFilter;
-      cached.magFilter = THREE.LinearFilter;
-      (overlaySphere.material as THREE.MeshBasicMaterial).map = cached;
+    const map = overlayTexturesRef.current.get(hoveredPin.hoverOverlayPng);
+    if (map) {
+      (overlaySphere.material as THREE.MeshBasicMaterial).map = map;
       (overlaySphere.material as THREE.MeshBasicMaterial).opacity = 1;
       (overlaySphere.material as THREE.MeshBasicMaterial).needsUpdate = true;
       overlaySphere.visible = true;
     } else {
       const loader = overlayLoaderRef.current || new THREE.TextureLoader();
       const tex = loader.load(hoveredPin.hoverOverlayPng, () => {
-        tex.generateMipmaps = false;
-        tex.minFilter = THREE.LinearFilter;
-        tex.magFilter = THREE.LinearFilter;
         overlayTexturesRef.current.set(hoveredPin.hoverOverlayPng!, tex);
         (overlaySphere.material as THREE.MeshBasicMaterial).map = tex;
         (overlaySphere.material as THREE.MeshBasicMaterial).opacity = 1;
@@ -408,42 +280,12 @@ export default function Pano360({
 
   return (
     <div className="fixed inset-0 flex h-screen w-screen overflow-hidden bg-black">
-      {/* THREE mount */}
       <div className="absolute inset-0" ref={mountRef} />
-
-      {/* PRELOADER OVERLAY */}
-      {!isLoaded && (
-        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center gap-6 bg-[#0b0b0f] text-white">
-          <div className="flex items-center gap-4">
-            <img src={projectLogo} alt="Project Logo" className="h-12 w-auto object-contain drop-shadow" />
-            <div className="h-10 w-px bg-white/20" />
-            <img src={companyLogo} alt="Company Logo" className="h-12 w-auto object-contain drop-shadow" />
-          </div>
-          <div className="w-[min(520px,80vw)]">
-            <div className="mb-2 flex justify-between text-xs text-white/70">
-              <span>Preparing experience…</span>
-              <span>{progress}%</span>
-            </div>
-            <div className="h-2 w-full overflow-hidden rounded-full bg-white/10 ring-1 ring-white/10">
-              <div
-                className="h-full rounded-full bg-white/80 transition-[width] duration-200"
-                style={{ width: `${progress}%` }}
-              />
-            </div>
-            <div className="mt-3 text-[11px] text-white/50">Loading panorama, overlays & pin cards</div>
-          </div>
-          <div className="mt-4 h-6 w-6 animate-spin rounded-full border-2 border-white/40 border-t-white/90" />
-        </div>
-      )}
-
-      {/* Pins layer */}
       <div className="pointer-events-none absolute left-0 top-0 z-10 h-full w-full">
         {filteredPins.map((p) => (
           <PinDot
             key={p.id}
-            ref={(el: HTMLButtonElement | null) => {
-              if (el) pinRefs.current[p.id] = el;
-            }}
+            ref={(el) => { pinRefs.current[p.id] = el; }}
             color={catMap.get(p.categoryId)?.neonColor || "#39FF14"}
             label={p.name}
             onEnter={() => setHoveredPinId(p.id)}
@@ -452,8 +294,6 @@ export default function Pano360({
           />
         ))}
       </div>
-
-      {/* Category Filter */}
       <div className="absolute left-4 top-4 z-20 flex flex-wrap gap-2 rounded-2xl border border-white/20 bg-white/10 p-2 backdrop-blur-xl shadow-lg">
         {categories.map((c) => {
           const active = enabledCats.has(c.id);
@@ -472,13 +312,9 @@ export default function Pano360({
           );
         })}
       </div>
-
-      {/* Pin Card */}
       {hoveredPin && (
-<aside
-  className="absolute right-4 top-4 z-20 w-80 max-w-[90%] rounded-2xl border border-white/20 bg-white/10 p-4 shadow-xl ring-1 ring-white/10 backdrop-blur-xl"
-  style={{ willChange: "transform, opacity", transform: "translateZ(0)" }}
->          <div className="flex h-full flex-col">
+        <aside className="absolute right-4 top-4 z-20 w-80 max-w-[90%] rounded-2xl border border-white/20 bg-white/10 p-4 shadow-xl ring-1 ring-white/10 backdrop-blur-xl">
+          <div className="flex h-full flex-col">
             <div className="mb-3 flex items-center gap-2">
               <span
                 className="inline-block h-3 w-3 rounded-full drop-shadow-[0_0_8px_rgba(255,255,255,0.6)]"
@@ -502,8 +338,6 @@ export default function Pano360({
           </div>
         </aside>
       )}
-
-      {/* Logos */}
       <div className="absolute bottom-4 left-4 z-20 flex items-center gap-4">
         <img src={projectLogo} alt="Project Logo" className="h-12 w-auto object-contain drop-shadow-lg" />
         <img src={companyLogo} alt="Company Logo" className="h-12 w-auto object-contain drop-shadow-lg" />
@@ -512,7 +346,8 @@ export default function Pano360({
   );
 }
 
-// ---- Example data (unchanged) ----
+
+
 export const exampleCategories: Category[] = [
   { id: "gov", label: "Devlet Kurumları", neonColor: "#F4FF00" },
   { id: "mall", label: "AVM", neonColor: "#39FF14" },
