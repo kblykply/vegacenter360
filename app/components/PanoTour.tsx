@@ -50,7 +50,7 @@ const PinDot = forwardRef<HTMLButtonElement, {
   >
     <span
       className="block h-4 w-4 rounded-full shadow-[0_0_12px_2px_var(--pin)] ring-2"
-      style={{ background: "#fff", boxShadow: `0 0 16px 3px ${color}`, borderColor: color as any }}
+      style={{ background: "#fff", boxShadow: `0 0 16px 3px ${color}`, borderColor: color }}
     />
     <span className="absolute left-1/2 top-[-22px] -translate-x-1/2 whitespace-nowrap rounded-md bg-black/70 px-2 py-0.5 text-xs text-white opacity-0 backdrop-blur-sm transition group-hover:opacity-100">
       {label}
@@ -68,8 +68,8 @@ export default function Pano360({
   initialFov = 65,
   autoRotate = true,
   rotationSpeed = 0.5,
-  projectLogo = "/vegacenter-beyaz-logo.png",
-  companyLogo = "/NATA-logobeyaz.png",
+  projectLogo = "/images/project-logo.png",
+  companyLogo = "/images/company-logo.png",
 }: {
   panoramaSrc: string;
   pins: Pin[];
@@ -327,26 +327,25 @@ export default function Pano360({
             </div>
             <div className="mt-auto grid grid-cols-2 gap-3 text-sm">
               <div className="rounded-lg bg-black/40 p-3">
-                <div className="text-xs text-neutral-300">Mesafe</div>
+                <div className="text-xs text-neutral-300">Distance</div>
                 <div className="text-base font-medium text-white">{hoveredPin.distanceKm.toFixed(1)} km</div>
               </div>
               <div className="rounded-lg bg-black/40 p-3">
-                <div className="text-xs text-neutral-300">Sürüş Süresi</div>
+                <div className="text-xs text-neutral-300">Drive time</div>
                 <div className="text-base font-medium text-white">{hoveredPin.durationMin} min</div>
               </div>
             </div>
           </div>
         </aside>
       )}
-
-
-           <div className="absolute bottom-4 left-4 z-20 flex items-center gap-4">
+      <div className="absolute bottom-4 left-4 z-20 flex items-center gap-4">
         <img src={projectLogo} alt="Project Logo" className="h-12 w-auto object-contain drop-shadow-lg" />
         <img src={companyLogo} alt="Company Logo" className="h-12 w-auto object-contain drop-shadow-lg" />
       </div>
     </div>
   );
 }
+
 export const exampleCategories: Category[] = [
   { id: "gov", label: "Devlet Kurumları", neonColor: "#F4FF00" },
   { id: "mall", label: "AVM", neonColor: "#39FF14" },
