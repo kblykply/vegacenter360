@@ -327,11 +327,11 @@ export default function Pano360({
             </div>
             <div className="mt-auto grid grid-cols-2 gap-3 text-sm">
               <div className="rounded-lg bg-black/40 p-3">
-                <div className="text-xs text-neutral-300">Distance</div>
+                <div className="text-xs text-neutral-300">Mesafe</div>
                 <div className="text-base font-medium text-white">{hoveredPin.distanceKm.toFixed(1)} km</div>
               </div>
               <div className="rounded-lg bg-black/40 p-3">
-                <div className="text-xs text-neutral-300">Drive time</div>
+                <div className="text-xs text-neutral-300">Dakika</div>
                 <div className="text-base font-medium text-white">{hoveredPin.durationMin} min</div>
               </div>
             </div>
