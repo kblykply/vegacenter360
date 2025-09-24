@@ -285,7 +285,7 @@ export default function Pano360({
         {filteredPins.map((p) => (
           <PinDot
             key={p.id}
-            ref={(el) => (pinRefs.current[p.id] = el)}
+            ref={(el) => { pinRefs.current[p.id] = el; }}
             color={catMap.get(p.categoryId)?.neonColor || "#39FF14"}
             label={p.name}
             onEnter={() => setHoveredPinId(p.id)}
@@ -345,6 +345,8 @@ export default function Pano360({
     </div>
   );
 }
+
+
 
 export const exampleCategories: Category[] = [
   { id: "gov", label: "Devlet Kurumları", neonColor: "#F4FF00" },
