@@ -67,7 +67,7 @@ export default function Pano360({
   initialPitch = 0,
   initialFov = 65,
   autoRotate = true,
-  rotationSpeed = 0.5,
+  rotationSpeed = 0.12,
   projectLogo = "/images/project-logo.png",
   companyLogo = "/images/company-logo.png",
 }: {
