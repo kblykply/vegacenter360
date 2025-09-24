@@ -1,789 +1,522 @@
-/* eslint-disable @next/next/no-img-element */
-// app/components/PanoTour.tsx
 "use client";
+import React, { useEffect, useMemo, useRef, useState, forwardRef } from "react";
+import * as THREE from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
-
-/* -----------------------------------------------------------
-   Dynamically load three.js (Next.js SSR-safe) with types
------------------------------------------------------------ */
-type ThreeNS = typeof import("three");
-type OrbitControlsModule = typeof import("three/examples/jsm/controls/OrbitControls.js");
-type OrbitControlsCtor = OrbitControlsModule["OrbitControls"];
-
-// minimal interface we use at runtime (avoids importing types eagerly)
-interface IOrbitControls {
-  enableDamping: boolean;
-  enableZoom: boolean;
-  enablePan: boolean;
-  rotateSpeed: number;
-  zoomSpeed: number;
-  minDistance: number;
-  maxDistance: number;
-  update(): void;
-  dispose(): void;
-}
-
-let THREE: ThreeNS | null = null;
-let OrbitControlsClass: OrbitControlsCtor | null = null;
-
-async function ensureThree() {
-  if (!THREE) {
-    THREE = await import("three");
-  }
-  if (!OrbitControlsClass) {
-    const mod: OrbitControlsModule = await import(
-      "three/examples/jsm/controls/OrbitControls.js"
-    );
-    OrbitControlsClass = mod.OrbitControls;
-  }
-}
-
-/* -----------------------------------------------------------
-   Types
------------------------------------------------------------ */
-export type SceneLink = {
-  to: string;
-  yaw: number; // +right / -left (deg)
-  pitch: number; // +down / -up (deg) [UI convention]
-  label?: string;
+export type Category = {
+  id: string;
+  label: string;
+  neonColor: string;
 };
 
 export type Pin = {
   id: string;
+  name: string;
+  categoryId: string;
   yaw: number;
   pitch: number;
-  label?: string;
-  title: string;
-  description?: string;
-  image?: string;
-  distanceMinutes?: number;
-  badge?: string;
-  links?: { href: string; text: string }[];
-  color?: string;
+  cardImage: string;
+  distanceKm: number;
+  durationMin: number;
+  hoverOverlayPng?: string;
 };
 
-export type Scene = {
-  id: string;
-  title?: string;
-  src: string; // equirect pano under /public
-  yaw?: number;
-  links?: SceneLink[];
-  pins?: Pin[]; // only scenes that have pins will render them
-};
-
-export type PanoTourProps = {
-  scenes: Scene[];
-  startId: string;
-  autoRotateSpeed?: number;
-  zoom?: boolean;
-  /** Logos shown in the top bar (project first) */
-  projectLogoSrc?: string;
-  companyLogoSrc?: string;
-  projectLogoAlt?: string;
-  companyLogoAlt?: string;
-};
-
-/* -----------------------------------------------------------
-   GL Helpers (typed)
------------------------------------------------------------ */
-function getWebGLContext(
-  attrs: WebGLContextAttributes
-): {
-  canvas: HTMLCanvasElement;
-  gl: WebGLRenderingContext | WebGL2RenderingContext | null;
-} {
-  const canvas = document.createElement("canvas");
-
-  // Narrow each getContext call to a WebGL context type
-  const get = <
-    T extends WebGLRenderingContext | WebGL2RenderingContext
-  >(
-    name: "webgl2" | "webgl" | "experimental-webgl"
-  ): T | null => canvas.getContext(name, attrs) as unknown as T | null;
-
-  const gl =
-    get<WebGL2RenderingContext>("webgl2") ??
-    get<WebGLRenderingContext>("webgl") ??
-    get<WebGLRenderingContext>("experimental-webgl");
-
-  return { canvas, gl };
+function yawPitchToVector3(yawDeg: number, pitchDeg: number, radius: number) {
+  const yaw = THREE.MathUtils.degToRad(yawDeg);
+  const pitch = THREE.MathUtils.degToRad(pitchDeg);
+  const x = -radius * Math.cos(pitch) * Math.sin(yaw);
+  const y = radius * Math.sin(pitch);
+  const z = -radius * Math.cos(pitch) * Math.cos(yaw);
+  return new THREE.Vector3(x, y, z);
 }
 
+const PinDot = forwardRef<HTMLButtonElement, {
+  color: string;
+  label: string;
+  onEnter: () => void;
+  onLeave: () => void;
+  onClick: () => void;
+}>(({ color, label, onEnter, onLeave, onClick }, ref) => (
+  <button
+    ref={ref}
+    className="group absolute pointer-events-auto -translate-x-1/2 -translate-y-1/2 rounded-full p-2 focus:outline-none"
+    onMouseEnter={onEnter}
+    onMouseLeave={onLeave}
+    onFocus={onEnter}
+    onBlur={onLeave}
+    onClick={onClick}
+    aria-label={label}
+    style={{ left: 0, top: 0, transform: "translate(-50%, -50%) translate3d(0px,0px,0)" }}
+  >
+    <span
+      className="block h-4 w-4 rounded-full shadow-[0_0_12px_2px_var(--pin)] ring-2"
+      style={{ background: "#fff", boxShadow: `0 0 16px 3px ${color}`, borderColor: color as any }}
+    />
+    <span className="absolute left-1/2 top-[-22px] -translate-x-1/2 whitespace-nowrap rounded-md bg-black/70 px-2 py-0.5 text-xs text-white opacity-0 backdrop-blur-sm transition group-hover:opacity-100">
+      {label}
+    </span>
+  </button>
+));
+PinDot.displayName = "PinDot";
 
-function createRenderer(
-  T: ThreeNS,
-  canvas: HTMLCanvasElement,
-  gl: WebGLRenderingContext | WebGL2RenderingContext
-): import("three").WebGLRenderer {
-  // Try the standard renderer first
-  try {
-    return new T.WebGLRenderer({ canvas, context: gl });
-  } catch {
-    // Optional runtime fallback for older builds that still expose WebGL1Renderer.
-    // We keep this fully typed by using `unknown` (no `any`) and asserting to the instance type.
-    const maybe = (T as unknown as Record<string, unknown>)["WebGL1Renderer"];
-    if (typeof maybe === "function") {
-      type Ctor = new (params: {
-        canvas: HTMLCanvasElement;
-        context: WebGLRenderingContext | WebGL2RenderingContext;
-      }) => unknown; // constructor returns unknown
+export default function Pano360({
+  panoramaSrc,
+  pins,
+  categories,
+  initialYaw = 0,
+  initialPitch = 0,
+  initialFov = 65,
+  autoRotate = true,
+  rotationSpeed = 0.5,
+  projectLogo = "/vegacenter-beyaz-logo.png",
+  companyLogo = "/NATA-logobeyaz.png",
+}: {
+  panoramaSrc: string;
+  pins: Pin[];
+  categories: Category[];
+  initialYaw?: number;
+  initialPitch?: number;
+  initialFov?: number;
+  autoRotate?: boolean;
+  rotationSpeed?: number;
+  projectLogo?: string;
+  companyLogo?: string;
+}) {
+  const mountRef = useRef<HTMLDivElement | null>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const overlaySphereRef = useRef<THREE.Mesh | null>(null);
+  const overlayTexturesRef = useRef<Map<string, THREE.Texture>>(new Map());
+  const loadingManagerRef = useRef<THREE.LoadingManager | null>(null);
+  const overlayLoaderRef = useRef<THREE.TextureLoader | null>(null);
+  const pinRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const filteredPinsRef = useRef<Pin[]>([]);
 
-      const WebGL1Ctor = maybe as Ctor;
-      const inst = new WebGL1Ctor({ canvas, context: gl });
-      return inst as import("three").WebGLRenderer; // assert to instance type
+  const [enabledCats, setEnabledCats] = useState<Set<string>>(
+    () => new Set(categories.map((c) => c.id))
+  );
+  const [hoveredPinId, setHoveredPinId] = useState<string | null>(null);
+  const hoveredPin = useMemo(() => pins.find((p) => p.id === hoveredPinId) || null, [hoveredPinId, pins]);
+
+  const catMap = useMemo(() => new Map(categories.map((c) => [c.id, c])), [categories]);
+  const filteredPins = useMemo(
+    () => pins.filter((p) => enabledCats.has(p.categoryId)),
+    [pins, enabledCats]
+  );
+
+  useEffect(() => {
+    filteredPinsRef.current = filteredPins;
+  }, [filteredPins]);
+
+  useEffect(() => {
+    if (!mountRef.current) return;
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(initialFov, 1, 0.1, 2000);
+    cameraRef.current = camera;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setClearColor(0x000000, 1);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    rendererRef.current = renderer;
+
+    const mount = mountRef.current;
+    mount.innerHTML = "";
+    mount.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableZoom = false;
+    controls.enableDamping = true;
+    controls.rotateSpeed = 0.15;
+    controls.dampingFactor = 0.06;
+    controls.enablePan = false;
+    controls.autoRotate = autoRotate;
+    controls.autoRotateSpeed = rotationSpeed;
+
+    const radius = 500;
+    const geo = new THREE.SphereGeometry(radius, 64, 64);
+    const tex = new THREE.TextureLoader().load(panoramaSrc);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    const mat = new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide });
+    const sphere = new THREE.Mesh(geo, mat);
+    scene.add(sphere);
+
+    const overlayGeo = new THREE.SphereGeometry(radius - 1, 64, 64);
+    const overlayMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, side: THREE.BackSide, depthWrite: false });
+    const overlaySphere = new THREE.Mesh(overlayGeo, overlayMat);
+    overlaySphere.visible = false;
+    overlaySphereRef.current = overlaySphere;
+    scene.add(overlaySphere);
+
+    controls.target.set(0, 0, 0);
+    const dir = yawPitchToVector3(initialYaw, initialPitch, 1).normalize();
+    camera.position.copy(dir.multiplyScalar(-0.1));
+    camera.lookAt(0, 0, 0);
+    camera.fov = initialFov;
+    camera.updateProjectionMatrix();
+
+    const onResize = () => {
+      const width = mount.clientWidth;
+      const height = mount.clientHeight;
+      renderer.setSize(width, height);
+      camera.aspect = width / height || 1;
+      camera.updateProjectionMatrix();
+    };
+    onResize();
+    const resizeObserver = new ResizeObserver(onResize);
+    resizeObserver.observe(mount);
+
+    const updatePinPositions = () => {
+      const width = mount.clientWidth;
+      const height = mount.clientHeight;
+      const pinsNow = filteredPinsRef.current;
+      for (let i = 0; i < pinsNow.length; i++) {
+        const p = pinsNow[i];
+        const world = yawPitchToVector3(p.yaw, p.pitch, radius - 0.1);
+        const projected = world.clone().project(camera);
+        const x = (projected.x * 0.5 + 0.5) * width;
+        const y = (-projected.y * 0.5 + 0.5) * height;
+        const visible = projected.z < 1 && projected.z > -1;
+        const el = pinRefs.current[p.id];
+        if (!el) continue;
+        el.style.transform = `translate(-50%, -50%) translate3d(${x}px, ${y}px, 0)`;
+        el.style.opacity = visible ? "1" : "0";
+        el.style.pointerEvents = visible ? "auto" : "none";
+      }
+    };
+
+    let rafId = 0;
+    let stopped = false;
+    const animate = () => {
+      if (stopped) return;
+      rafId = requestAnimationFrame(animate);
+      controls.autoRotate = autoRotate;
+      controls.autoRotateSpeed = rotationSpeed;
+      controls.update();
+      renderer.render(scene, camera);
+      updatePinPositions();
+    };
+    animate();
+
+    const onStart = () => (controls.autoRotate = false);
+    const onEnd = () => (controls.autoRotate = autoRotate);
+    controls.addEventListener("start", onStart);
+    controls.addEventListener("end", onEnd);
+
+    return () => {
+      controls.removeEventListener("start", onStart);
+      controls.removeEventListener("end", onEnd);
+      resizeObserver.disconnect();
+      stopped = true;
+      cancelAnimationFrame(rafId);
+      renderer.dispose();
+      geo.dispose();
+      mat.dispose();
+      tex.dispose();
+      overlayGeo.dispose();
+      const m = overlaySphere.material as THREE.MeshBasicMaterial;
+      if (m.map) m.map.dispose();
+      m.dispose();
+    };
+  }, [panoramaSrc, initialYaw, initialPitch, initialFov, autoRotate, rotationSpeed]);
+
+  useEffect(() => {
+    THREE.Cache.enabled = true;
+    if (!loadingManagerRef.current) loadingManagerRef.current = new THREE.LoadingManager();
+    if (!overlayLoaderRef.current) overlayLoaderRef.current = new THREE.TextureLoader(loadingManagerRef.current);
+    const loader = overlayLoaderRef.current;
+    pins.forEach((p) => {
+      if (!p.hoverOverlayPng) return;
+      if (overlayTexturesRef.current.has(p.hoverOverlayPng)) return;
+      const t = loader.load(p.hoverOverlayPng);
+      t.colorSpace = THREE.SRGBColorSpace;
+      overlayTexturesRef.current.set(p.hoverOverlayPng, t);
+    });
+    return () => {};
+  }, [pins]);
+
+  useEffect(() => {
+    const overlaySphere = overlaySphereRef.current;
+    if (!overlaySphere) return;
+
+    if (!hoveredPin || !hoveredPin.hoverOverlayPng) {
+      (overlaySphere.material as THREE.MeshBasicMaterial).opacity = 0;
+      overlaySphere.visible = false;
+      return;
     }
-    throw new Error("WebGL renderer could not be created.");
-  }
-}
 
+    const map = overlayTexturesRef.current.get(hoveredPin.hoverOverlayPng);
+    if (map) {
+      (overlaySphere.material as THREE.MeshBasicMaterial).map = map;
+      (overlaySphere.material as THREE.MeshBasicMaterial).opacity = 1;
+      (overlaySphere.material as THREE.MeshBasicMaterial).needsUpdate = true;
+      overlaySphere.visible = true;
+    } else {
+      const loader = overlayLoaderRef.current || new THREE.TextureLoader();
+      const tex = loader.load(hoveredPin.hoverOverlayPng, () => {
+        overlayTexturesRef.current.set(hoveredPin.hoverOverlayPng!, tex);
+        (overlaySphere.material as THREE.MeshBasicMaterial).map = tex;
+        (overlaySphere.material as THREE.MeshBasicMaterial).opacity = 1;
+        (overlaySphere.material as THREE.MeshBasicMaterial).needsUpdate = true;
+        overlaySphere.visible = true;
+      });
+      tex.colorSpace = THREE.SRGBColorSpace;
+    }
+  }, [hoveredPin]);
 
-
-type LoseContextExtension = { loseContext: () => void };
-
-/* -----------------------------------------------------------
-   Image loader (typed, no `any`)
------------------------------------------------------------ */
-async function loadTextureSmart(
-  url: string,
-  maxWidth = 8192
-): Promise<import("three").CanvasTexture> {
-  await ensureThree();
-  const T = THREE!;
-
-  // absolute URL (handles basePath)
-  const absolute = url.startsWith("http")
-    ? url
-    : new URL(url, window.location.origin).toString();
-
-  let blob: Blob | null = null;
-
-  // Fetch first so we can surface HTTP errors
-  try {
-    const res = await fetch(absolute, { cache: "force-cache" });
-    if (!res.ok)
-      throw new Error(`HTTP ${res.status} ${res.statusText} for ${absolute}`);
-    blob = await res.blob();
-  } catch {
-    // fall through to <img> path
-  }
-
-  const makeTextureFromCanvas = (canvas: HTMLCanvasElement) => {
-    const tex = new T.CanvasTexture(canvas);
-    tex.colorSpace = T.SRGBColorSpace;
-    tex.minFilter = T.LinearMipmapLinearFilter;
-    tex.magFilter = T.LinearFilter;
-    tex.generateMipmaps = true;
-    return tex;
+  const toggleCat = (id: string) => {
+    setEnabledCats((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      if (hoveredPinId && !next.has(pins.find((p) => p.id === hoveredPinId)?.categoryId || "")) {
+        setHoveredPinId(null);
+      }
+      return next;
+    });
   };
 
-  // Try ImageBitmap path if we have a blob
-  if (blob) {
-    try {
-      const bmp = await createImageBitmap(blob);
-      const w = bmp.width;
-      const h = bmp.height;
-      const scale = w > maxWidth ? maxWidth / w : 1;
-      const sw = Math.round(w * scale);
-      const sh = Math.round(h * scale);
-
-      const off = document.createElement("canvas");
-      off.width = sw;
-      off.height = sh;
-      const ctx = off.getContext("2d")!;
-      ctx.drawImage(bmp, 0, 0, sw, sh);
-      bmp.close();
-      return makeTextureFromCanvas(off);
-    } catch {
-      // fall back
-    }
-  }
-
-  // Fallback: decode via <img>
-  const img = new Image();
-  img.decoding = "async";
-  img.src = blob ? URL.createObjectURL(blob) : absolute;
-
-  await new Promise<void>((resolve, reject) => {
-    img.onload = () => resolve();
-    img.onerror = () =>
-      reject(new Error(`Image decode failed for ${absolute}`));
-  });
-
-  try {
-    const w = img.naturalWidth;
-    const h = img.naturalHeight;
-    const scale = w > maxWidth ? maxWidth / w : 1;
-    const sw = Math.round(w * scale);
-    const sh = Math.round(h * scale);
-
-    const off = document.createElement("canvas");
-    off.width = sw;
-    off.height = sh;
-    const ctx = off.getContext("2d")!;
-    ctx.drawImage(img, 0, 0, sw, sh);
-    return makeTextureFromCanvas(off);
-  } finally {
-    if (blob) URL.revokeObjectURL(img.src);
-  }
-}
-
-/* ===========================================================
-   PanoViewer (single panorama, fills its parent)
-=========================================================== */
-type Hotspot = {
-  yaw: number;
-  pitch: number;
-  label?: string;
-  onClick?: () => void;
-};
-
-export function PanoViewer({
-  src,
-  yaw = 0,
-  hotspots = [],
-  pins = [],
-  autoRotateSpeed = 0,
-  zoom = true,
-  debug = true,
-  className = "absolute inset-0",
-}: {
-  src: string;
-  yaw?: number;
-  hotspots?: Hotspot[];
-  pins?: Pin[];
-  autoRotateSpeed?: number;
-  zoom?: boolean;
-  debug?: boolean;
-  className?: string;
-}) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const [ready, setReady] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let mounted = true;
-
-    // three.js objects
-let renderer: import("three").WebGLRenderer | null = null;
-
-
-
-    let gl: WebGLRenderingContext | WebGL2RenderingContext | null = null;
-    let scene: import("three").Scene | null = null;
-    let camera: import("three").PerspectiveCamera | null = null;
-    let controls: IOrbitControls | null = null;
-    let sphere: import("three").Mesh | null = null;
-    let geometry: import("three").SphereGeometry | null = null;
-    let material: import("three").MeshBasicMaterial | null = null;
-    let texture: import("three").Texture | null = null;
-    let animId = 0;
-
-    const pinWraps: HTMLDivElement[] = [];
-    const hotspotEls: HTMLDivElement[] = [];
-
-    const toVec3 = (yawDeg: number, pitchDeg: number) => {
-      const T = THREE!;
-      const yawR = (yawDeg * Math.PI) / 180;
-      const pitchR = (pitchDeg * Math.PI) / 180;
-      const x = Math.cos(pitchR) * Math.sin(yawR);
-      const y = Math.sin(pitchR);
-      const z = Math.cos(pitchR) * Math.cos(yawR);
-      return new T.Vector3(x, y, z).multiplyScalar(49.9);
-    };
-
-    // for debug: compute yaw/pitch from mouse
-    const getYawPitchFromPointer = (ev: MouseEvent) => {
-      if (!camera || !renderer) return { yaw: 0, pitch: 0 };
-      const rect = renderer.domElement.getBoundingClientRect();
-      const x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
-      const y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
-      const T = THREE!;
-      const v = new T.Vector3(x, y, 0.5)
-        .unproject(camera)
-        .sub(camera.position)
-        .normalize();
-      const yawD = (Math.atan2(v.x, v.z) * 180) / Math.PI;
-      const pitchD = (Math.asin(v.y) * 180) / Math.PI; // +up
-      return { yaw: yawD, pitch: -pitchD }; // UI uses +down
-    };
-
-    let cleanup = () => {};
-
-    (async () => {
-      await ensureThree();
-      if (!mounted || !THREE || !containerRef.current) return;
-      const T = THREE!;
-
-      const el = containerRef.current;
-      const size = () => [el.clientWidth, el.clientHeight] as const;
-
-      // --- Preflight GL ---
-      const attrs: WebGLContextAttributes = {
-        alpha: false,
-        antialias: false,
-        depth: true,
-        stencil: false,
-        desynchronized: true as unknown as boolean, // flag varies
-        powerPreference: "high-performance",
-        preserveDrawingBuffer: false,
-      };
-      const { canvas, gl: ctx } = getWebGLContext(attrs);
-      gl = ctx;
-
-      if (!gl) {
-        setError(
-          "WebGL is unavailable. Close other GPU-heavy tabs, enable hardware acceleration, or reduce image size."
-        );
-        return;
-      }
-
-      // --- Renderer from that context ---
-      renderer = createRenderer(T, canvas, gl);
-      renderer.setClearColor(0x000000, 1);
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.75));
-      const [w0, h0] = size();
-      renderer.setSize(w0, h0);
-      el.appendChild(renderer.domElement);
-
-      renderer.domElement.addEventListener(
-        "webglcontextlost",
-        (ev: Event) => {
-          ev.preventDefault();
-          setError("Graphics context lost. Reload the page.");
-        },
-        false
-      );
-
-      // --- Scene / Camera / Controls ---
-      scene = new T.Scene();
-      camera = new T.PerspectiveCamera(75, w0 / h0, 0.1, 1000);
-      camera.position.set(0, 0, 0.1);
-
-      const Controls = OrbitControlsClass!;
-      controls = new Controls(camera, renderer.domElement) as unknown as IOrbitControls;
-      controls.enableDamping = true;
-      controls.enableZoom = zoom;
-      controls.enablePan = false;
-      controls.rotateSpeed = 0.25;
-      controls.zoomSpeed = 0.6;
-      controls.minDistance = 0.1;
-      controls.maxDistance = 3;
-
-      // --- Texture (downscale big 12k images to <= 8k) ---
-      try {
-        texture = await loadTextureSmart(src, 8192);
-      } catch (e: unknown) {
-        const msg =
-          e instanceof Error ? e.message : "Failed to load image.";
-        setError(msg);
-        return;
-      }
-
-      geometry = new T.SphereGeometry(50, 64, 48);
-      geometry.scale(-1, 1, 1);
-      material = new T.MeshBasicMaterial({ map: texture });
-      sphere = new T.Mesh(geometry, material);
-      scene.add(sphere);
-
-      // initial yaw
-      camera.rotation.y = -(yaw * Math.PI) / 180;
-
-      // --- Hotspots (scene links) ---
-      hotspots.forEach((h) => {
-        const d = document.createElement("div");
-        d.className =
-          "absolute -translate-x-1/2 -translate-y-1/2 px-2.5 py-1 rounded-full text-[11px] leading-none " +
-          "bg-white/35 text-slate-900 border border-white/60 shadow-[0_8px_24px_rgba(0,0,0,0.18)] " +
-          "backdrop-blur-md hover:bg-white/50 transition";
-        d.textContent = h.label || "●";
-        d.style.cursor = h.onClick ? "pointer" : "default";
-        if (h.onClick) d.addEventListener("click", h.onClick);
-        el.appendChild(d);
-        hotspotEls.push(d);
-      });
-
-      // --- Pins with info cards ---
-      pins.forEach((p) => {
-        const wrap = document.createElement("div");
-        wrap.className =
-          "absolute -translate-x-1/2 -translate-y-1/2 pointer-events-auto group";
-
-        const btn = document.createElement("button");
-        btn.className =
-          "relative h-4 w-4 rounded-full shadow ring-2 transition " +
-          "border border-white/70 bg-white ring-white/60 " +
-          "group-hover:scale-110";
-        if (p.color) {
-          btn.style.background = p.color;
-          btn.style.borderColor = p.color;
-          btn.style.boxShadow = `0 0 0 2px ${p.color}`;
-        }
-        btn.title = p.label || p.title;
-
-        if (p.label) {
-          const lbl = document.createElement("div");
-          lbl.className =
-            "absolute left-1/2 -translate-x-1/2 mt-2 whitespace-nowrap " +
-            "px-1.5 py-0.5 rounded-full text-[10px] bg-white/70 text-black border border-white/80";
-          lbl.textContent = p.label;
-          btn.appendChild(lbl);
-        }
-
-        const card = document.createElement("div");
-        card.className =
-          "absolute left-1/2 -translate-x-1/2 -translate-y-3 opacity-0 " +
-          "group-hover:opacity-100 group-[.open]:opacity-100 " +
-          "group-hover:pointer-events-auto group-[.open]:pointer-events-auto " +
-          "pointer-events-none transition";
-        card.innerHTML = `
-          <div class="w-72 max-w-[80vw] rounded-xl bg-black/70 text-white backdrop-blur border border-white/20 shadow-xl p-3">
-            <div class="flex gap-3">
-              ${p.image ? `<img src="${p.image}" class="w-20 h-20 rounded-lg object-cover" alt="${p.title}"/>` : ""}
-              <div class="min-w-0">
-                <div class="font-medium text-sm leading-tight">${p.title}</div>
-                ${p.badge ? `<div class="text-[10px] uppercase tracking-wide text-white/70 mt-0.5">${p.badge}</div>` : ""}
-                ${p.description ? `<div class="text-white/80 text-xs mt-1">${p.description}</div>` : ""}
-                ${p.distanceMinutes != null ? `<div class="text-white/60 text-[11px] mt-1">~${p.distanceMinutes} min</div>` : ""}
-                ${
-                  p.links?.length
-                    ? `<div class="mt-2 flex gap-2 flex-wrap">
-                        ${p.links
-                          .map(
-                            (l) =>
-                              `<a href="${l.href}" target="_blank" class="inline-flex items-center text-xs px-2 py-1 rounded bg-white text-black hover:bg-white/90">${l.text}</a>`
-                          )
-                          .join("")}
-                       </div>`
-                    : ""
-                }
+  return (
+    <div className="fixed inset-0 flex h-screen w-screen overflow-hidden bg-black">
+      <div className="absolute inset-0" ref={mountRef} />
+      <div className="pointer-events-none absolute left-0 top-0 z-10 h-full w-full">
+        {filteredPins.map((p) => (
+          <PinDot
+            key={p.id}
+            ref={(el) => (pinRefs.current[p.id] = el)}
+            color={catMap.get(p.categoryId)?.neonColor || "#39FF14"}
+            label={p.name}
+            onEnter={() => setHoveredPinId(p.id)}
+            onLeave={() => setHoveredPinId((cur) => (cur === p.id ? null : cur))}
+            onClick={() => setHoveredPinId(p.id)}
+          />
+        ))}
+      </div>
+      <div className="absolute left-4 top-4 z-20 flex flex-wrap gap-2 rounded-2xl border border-white/20 bg-white/10 p-2 backdrop-blur-xl shadow-lg">
+        {categories.map((c) => {
+          const active = enabledCats.has(c.id);
+          return (
+            <button
+              key={c.id}
+              onClick={() => toggleCat(c.id)}
+              className={`rounded-full px-3 py-1 text-sm font-medium transition ${
+                active ? "bg-white/90 text-black" : "bg-black/50 text-white"
+              }`}
+              style={{ boxShadow: active ? `0 0 16px 2px ${c.neonColor}` : undefined, border: `1px solid ${c.neonColor}` }}
+            >
+              <span className="inline-block h-2 w-2 -translate-y-0.5 rounded-full" style={{ background: c.neonColor }} />
+              <span className="ml-2">{c.label}</span>
+            </button>
+          );
+        })}
+      </div>
+      {hoveredPin && (
+        <aside className="absolute right-4 top-4 z-20 w-80 max-w-[90%] rounded-2xl border border-white/20 bg-white/10 p-4 shadow-xl ring-1 ring-white/10 backdrop-blur-xl">
+          <div className="flex h-full flex-col">
+            <div className="mb-3 flex items-center gap-2">
+              <span
+                className="inline-block h-3 w-3 rounded-full drop-shadow-[0_0_8px_rgba(255,255,255,0.6)]"
+                style={{ background: catMap.get(hoveredPin.categoryId)?.neonColor || "#00E5FF", boxShadow: `0 0 12px 2px ${catMap.get(hoveredPin.categoryId)?.neonColor || "#00E5FF"}` }}
+              />
+              <h3 className="text-lg font-semibold leading-tight text-white">{hoveredPin.name}</h3>
+            </div>
+            <div className="relative mb-3 aspect-[4/3] w-full overflow-hidden rounded-xl border border-white/20 ring-1 ring-white/10">
+              <img src={hoveredPin.cardImage} alt={hoveredPin.name} className="h-full w-full object-cover" />
+            </div>
+            <div className="mt-auto grid grid-cols-2 gap-3 text-sm">
+              <div className="rounded-lg bg-black/40 p-3">
+                <div className="text-xs text-neutral-300">Mesafe</div>
+                <div className="text-base font-medium text-white">{hoveredPin.distanceKm.toFixed(1)} km</div>
+              </div>
+              <div className="rounded-lg bg-black/40 p-3">
+                <div className="text-xs text-neutral-300">Sürüş Süresi</div>
+                <div className="text-base font-medium text-white">{hoveredPin.durationMin} min</div>
               </div>
             </div>
           </div>
-        `;
-        wrap.appendChild(btn);
-        wrap.appendChild(card);
-
-        // hover & tap
-        let open = false;
-        const openCard = () => {
-          open = true;
-          wrap.classList.add("open");
-        };
-        const closeCard = () => {
-          open = false;
-          wrap.classList.remove("open");
-        };
-        btn.addEventListener("mouseenter", openCard);
-        wrap.addEventListener("mouseleave", closeCard);
-        btn.addEventListener("click", () => (open ? closeCard() : openCard()));
-
-        el.appendChild(wrap);
-        pinWraps.push(wrap);
-      });
-
-      // --- render loop ---
-      const clock = new T.Clock();
-      const loop = () => {
-        animId = requestAnimationFrame(loop);
-        const dt = clock.getDelta();
-        if (autoRotateSpeed && sphere) {
-          sphere.rotation.y += ((autoRotateSpeed * Math.PI) / 180) * dt;
-        }
-        controls?.update();
-        if (scene && camera && renderer) renderer.render(scene, camera);
-
-        const w = el.clientWidth;
-        const h = el.clientHeight;
-
-        hotspots.forEach((hs, i) => {
-          const p3 = toVec3(hs.yaw, -hs.pitch);
-          p3.project(camera!);
-          const visible = p3.z < 1;
-          const x = (p3.x * 0.5 + 0.5) * w;
-          const y = (-p3.y * 0.5 + 0.5) * h;
-          const node = hotspotEls[i];
-          node.style.display = visible ? "block" : "none";
-          if (visible) node.style.transform = `translate(${x}px, ${y}px)`;
-        });
-
-        pins.forEach((pin, i) => {
-          const p3 = toVec3(pin.yaw, -pin.pitch);
-          p3.project(camera!);
-          const visible = p3.z < 1;
-          const x = (p3.x * 0.5 + 0.5) * w;
-          const y = (-p3.y * 0.5 + 0.5) * h;
-          const wrap = pinWraps[i];
-          wrap.style.display = visible ? "block" : "none";
-          if (visible) wrap.style.transform = `translate(${x}px, ${y}px)`;
-        });
-      };
-
-      // resize
-      const onResize = () => {
-        const nw = el.clientWidth;
-        const nh = el.clientHeight;
-        renderer!.setSize(nw, nh);
-        if (camera) {
-          camera.aspect = nw / nh;
-          camera.updateProjectionMatrix();
-        }
-      };
-      window.addEventListener("resize", onResize);
-
-      // debug: Alt+Click to print yaw/pitch
-      const onAltClick = (e: MouseEvent) => {
-        if (!debug || !e.altKey) return;
-        const a = getYawPitchFromPointer(e);
-        // eslint-disable-next-line no-console
-        console.log("Pin draft:", {
-          id: `pin_${Date.now()}`,
-          yaw: Number(a.yaw.toFixed(2)),
-          pitch: Number(a.pitch.toFixed(2)),
-          title: "New place",
-          description: "Describe...",
-          image: "/pins/example.jpg",
-          distanceMinutes: 5,
-          label: "Label",
-          badge: "Type",
-          links: [{ href: "https://example.com", text: "More" }],
-        });
-      };
-      el.addEventListener("click", onAltClick);
-
-      setError(null);
-      setReady(true);
-      loop();
-
-      // --- cleanup ---
-      cleanup = () => {
-        cancelAnimationFrame(animId);
-        window.removeEventListener("resize", onResize);
-        el.removeEventListener("click", onAltClick);
-        hotspotEls.forEach((d) => d.remove());
-        pinWraps.forEach((d) => d.remove());
-
-        try {
-          if (gl && "getExtension" in gl) {
-            const ext = (gl as WebGLRenderingContext).getExtension(
-              "WEBGL_lose_context"
-            ) as LoseContextExtension | null;
-            ext?.loseContext();
-          }
-        } catch {
-          /* ignore */
-        }
-
-        controls?.dispose();
-        if (renderer && renderer.domElement.parentElement === el) {
-          el.removeChild(renderer.domElement);
-        }
-        geometry?.dispose();
-        material?.dispose();
-        texture?.dispose();
-        renderer?.dispose?.();
-      };
-    })();
-
-    return () => {
-      mounted = false;
-      cleanup();
-    };
-  }, [src, yaw, hotspots, pins, autoRotateSpeed, zoom, debug]);
-
-  return (
-    <div ref={containerRef} className={className}>
-      {/* subtle glow */}
-      <div className="pointer-events-none absolute inset-0">
-        <div className="absolute -top-24 -left-24 h-64 w-64 rounded-full bg-gradient-to-br from-white/40 to-transparent blur-3xl" />
-        <div className="absolute -bottom-24 -right-24 h-64 w-64 rounded-full bg-gradient-to-tl from-white/30 to-transparent blur-3xl" />
-      </div>
-
-      {!ready && !error && (
-        <div className="absolute inset-0 grid place-items-center text-sm text-white/80">
-          Loading panorama…
-        </div>
+        </aside>
       )}
-      {error && (
-        <div className="absolute inset-0 grid place-items-center">
-          <div className="rounded-xl bg-black/70 text-white px-4 py-3 text-sm backdrop-blur">
-            {error}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
 
-/* ===========================================================
-   PanoTour (FULLSCREEN with glass UI + logos)
-=========================================================== */
-export default function PanoTour({
-  scenes,
-  startId,
-  autoRotateSpeed = 0.12,
-  zoom = true,
-  projectLogoSrc = "/logos/project.png",
-  companyLogoSrc = "/logos/company.png",
-  projectLogoAlt = "Project logo",
-  companyLogoAlt = "Company logo",
-}: PanoTourProps) {
-  const byId = useMemo(
-    () => Object.fromEntries(scenes.map((s) => [s.id, s])),
-    [scenes]
-  ) as Record<string, Scene>;
-  const [currentId, setCurrentId] = useState(startId);
-  const [autoSpin, setAutoSpin] = useState<boolean>(true);
-  const current = byId[currentId];
 
-  // lock page scroll while fullscreen tour is mounted
-  useEffect(() => {
-    const { documentElement: html, body } = document;
-    const prevHtml = html.style.overflow;
-    const prevBody = body.style.overflow;
-    html.style.overflow = "hidden";
-    body.style.overflow = "hidden";
-    return () => {
-      html.style.overflow = prevHtml;
-      body.style.overflow = prevBody;
-    };
-  }, []);
-
-  if (!current) {
-    return (
-      <div className="fixed inset-0 grid place-items-center text-red-600">
-        Scene “{currentId}” not found.
-      </div>
-    );
-  }
-
-  const idx = scenes.findIndex((s) => s.id === currentId);
-  const prev = scenes[(idx - 1 + scenes.length) % scenes.length];
-  const next = scenes[(idx + 1) % scenes.length];
-
-  const hotspots: Hotspot[] = (current.links || []).map((lnk) => ({
-    yaw: lnk.yaw,
-    pitch: lnk.pitch,
-    label: lnk.label || "Go",
-    onClick: () => setCurrentId(lnk.to),
-  }));
-
-  return (
-    <div className="fixed inset-0 bg-black">
-      {/* Force remount on scene change -> new clean renderer each time */}
-      <PanoViewer
-        key={current.id}
-        src={current.src}
-        yaw={current.yaw || 0}
-        hotspots={hotspots}
-        pins={current.pins || []}
-        autoRotateSpeed={autoSpin ? autoRotateSpeed : 0}
-        zoom={zoom}
-        className="absolute inset-0"
-      />
-
-      {/* ======= GLASS UI OVERLAYS ======= */}
-
-      {/* Top bar with logos */}
-      <div className="pointer-events-none absolute left-0 right-0 top-0 p-3">
-        <div className="mx-auto max-w-[min(1280px,100vw)] pointer-events-auto rounded-2xl bg-white/10 border border-white/20 backdrop-blur-xl text-white shadow-[0_12px_40px_rgba(0,0,0,.25)]">
-          <div className="flex items-center justify-between gap-3 px-4 py-3">
-            <div className="flex items-center gap-4 min-w-0">
-              <img
-                src={projectLogoSrc}
-                alt={projectLogoAlt}
-                className="h-8 w-auto object-contain"
-              />
-              <div className="h-6 w-px bg-white/30" />
-              <img
-                src={companyLogoSrc}
-                alt={companyLogoAlt}
-                className="h-8 w-auto object-contain"
-              />
-              <div className="ml-4">
-                <div className="text-[11px] uppercase tracking-wider text-white/70">
-                  Panorama Tour
-                </div>
-                <h2 className="text-lg font-semibold leading-tight">
-                  {current.title || current.id}
-                </h2>
-              </div>
-            </div>
-
-            {/* scene chips */}
-            <div className="hidden md:flex flex-wrap gap-2">
-              {scenes.map((s) => (
-                <button
-                  key={s.id}
-                  onClick={() => setCurrentId(s.id)}
-                  className={`px-3 py-1.5 rounded-full text-xs transition border backdrop-blur-md ${
-                    s.id === currentId
-                      ? "bg-white text-black border-white shadow"
-                      : "bg-white/25 text-white border-white/50 hover:bg-white/35"
-                  }`}
-                  title={s.title || s.id}
-                >
-                  {s.title || s.id}
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Bottom dock */}
-      <div className="pointer-events-none absolute left-0 right-0 bottom-0 p-3">
-        <div className="mx-auto max-w-[min(1280px,100vw)] pointer-events-auto flex flex-col gap-2">
-          {/* Control pill */}
-          <div className="self-center flex items-center gap-2 rounded-full bg-white/15 border border-white/30 backdrop-blur-xl px-2 py-1.5 text-white shadow-[0_10px_35px_rgba(0,0,0,.35)]">
-            <button
-              onClick={() => setCurrentId(prev.id)}
-              className="px-3 py-1 rounded-full text-xs bg-white/60 text-black hover:bg-white/80 transition"
-              title="Previous"
-            >
-              ‹ Prev
-            </button>
-            <button
-              onClick={() => setAutoSpin((v) => !v)}
-              className="px-3 py-1 rounded-full text-xs bg-white/60 text-black hover:bg-white/80 transition"
-              title={autoSpin ? "Pause auto-rotate" : "Play auto-rotate"}
-            >
-              {autoSpin ? "Pause" : "Play"}
-            </button>
-            <button
-              onClick={() => setCurrentId(next.id)}
-              className="px-3 py-1 rounded-full text-xs bg-white/60 text-black hover:bg-white/80 transition"
-              title="Next"
-            >
-              Next ›
-            </button>
-          </div>
-
-          {/* Thumbs strip */}
-          <div className="rounded-2xl border border-white/20 bg-white/10 backdrop-blur-xl px-2 py-2">
-            <div className="flex gap-2 overflow-x-auto">
-              {scenes.map((s) => (
-                <button
-                  key={s.id}
-                  onClick={() => setCurrentId(s.id)}
-                  className={`shrink-0 w-36 h-20 rounded-xl overflow-hidden border transition ${
-                    s.id === currentId
-                      ? "ring-2 ring-white border-white"
-                      : "border-white/40 hover:border-white/60"
-                  }`}
-                  title={s.title || s.id}
-                >
-                  <img
-                    src={s.src}
-                    alt={s.id}
-                    className="w-full h-full object-cover"
-                  />
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
+           <div className="absolute bottom-4 left-4 z-20 flex items-center gap-4">
+        <img src={projectLogo} alt="Project Logo" className="h-12 w-auto object-contain drop-shadow-lg" />
+        <img src={companyLogo} alt="Company Logo" className="h-12 w-auto object-contain drop-shadow-lg" />
       </div>
     </div>
   );
 }
+export const exampleCategories: Category[] = [
+  { id: "gov", label: "Devlet Kurumları", neonColor: "#F4FF00" },
+  { id: "mall", label: "AVM", neonColor: "#39FF14" },
+  { id: "school", label: "Okul", neonColor: "#00E5FF" },
+  { id: "hospital", label: "Hastane", neonColor: "#FF1744" },
+  { id: "road", label: "Yollar / Mahalleler", neonColor: "#FF8C00" },
+];
+
+export const examplePins: Pin[] = [
+  // DEVLET KURUMLARI
+  {
+    id: "gov1",
+    name: "Havelsan",
+    categoryId: "gov",
+    yaw: -65,
+    pitch: -10,
+    cardImage: "/pins/HAVELSAN.jpeg",
+    distanceKm:  1.7,
+    durationMin: 5,
+    hoverOverlayPng: "/overlays/havelsan.png",
+  },
+  {
+    id: "gov2",
+    name: "TC Çevre ve Şehircilik Bakanlığı",
+    categoryId: "gov",
+    yaw: 60,
+    pitch: -4,
+    cardImage: "/pins/tc-cevrevesehircilik.jpeg",
+    distanceKm: 1.9,
+    durationMin: 5,
+    hoverOverlayPng: "/overlays/cevre.png",
+  },
+  {
+    id: "gov3",
+    name: "TC Tarım ve Orman Bakanlığı",
+    categoryId: "gov",
+    yaw: 73,
+    pitch: -3,
+    cardImage: "/pins/tarim.jpeg",
+    distanceKm: 2.9,
+    durationMin: 6,
+    hoverOverlayPng: "/overlays/tctarimveorman.png",
+  },
+  {
+    id: "gov4",
+    name: "TC Diyanet İşleri Başkanlığı",
+    categoryId: "gov",
+    yaw: 33,
+    pitch: -8,
+    cardImage: "/pins/diyanetbaskanligi.jpeg",
+    distanceKm: 3.7,
+    durationMin: 7,
+    hoverOverlayPng: "/overlays/diyanet.png",
+  },
+  {
+    id: "gov5",
+    name: "TOBB",
+    categoryId: "gov",
+    yaw: 50,
+    pitch: -5,
+    cardImage: "/pins/TOBB.jpeg",
+    distanceKm: 1.1,
+    durationMin: 3,
+    hoverOverlayPng: "/overlays/TOBB.png",
+  },
+
+  // AVM
+  {
+    id: "mall1",
+    name: "KentPark AVM",
+    categoryId: "mall",
+    yaw: -42,
+    pitch: -7,
+    cardImage: "/pins/kentparkavm.jpeg",
+    distanceKm: 1.3,
+    durationMin: 3,
+    hoverOverlayPng: "/overlays/KENTPARKAVM.png",
+  },
+  {
+    id: "mall2",
+    name: "MAIDAN AVM",
+    categoryId: "mall",
+    yaw: 25,
+    pitch: -14,
+    cardImage: "/pins/maidanavm.jpeg",
+    distanceKm: 0.9,
+    durationMin: 3,
+    hoverOverlayPng: "/overlays/maidanavm.png",
+  },
+  {
+    id: "mall3",
+    name: "Tepe Prime",
+    categoryId: "mall",
+    yaw: 76,
+    pitch: -4,
+    cardImage: "/pins/tepeprime.jpeg",
+    distanceKm: 1.7,
+    durationMin: 4,
+    hoverOverlayPng: "/overlays/tepeprime.png",
+  },
+  {
+    id: "mall4",
+    name: "Cepa AVM",
+    categoryId: "mall",
+    yaw: -48,
+    pitch: -5,
+    cardImage: "/pins/cepaavm.jpeg",
+    distanceKm: 1.5,
+    durationMin: 4,
+    hoverOverlayPng: "/overlays/cepaavm.png",
+  },
+
+  // OKUL
+  {
+    id: "school1",
+    name: "ODTÜ",
+    categoryId: "school",
+    yaw: -20,
+    pitch: -5,
+    cardImage: "/pins/odtü.jpeg",
+    distanceKm: 4.2,
+    durationMin: 6,
+    hoverOverlayPng: "/overlays/ODTU.png",
+  },
+
+  // HASTANE
+  {
+    id: "hospital1",
+    name: "Bilkent Şehir Hastanesi",
+    categoryId: "hospital",
+    yaw: 43,
+    pitch: -4,
+    cardImage: "/pins/bilkenthastane.jpeg",
+    distanceKm: 3.1,
+    durationMin: 8,
+    hoverOverlayPng: "/overlays/bilkenthastane.png",
+  },
+
+  // YOLLAR / MAHALLELER
+  {
+    id: "road1",
+    name: "Bilkent Sabancı Bulvarı",
+    categoryId: "road",
+    yaw: 29,
+    pitch: -16,
+    cardImage: "/pins/bilkentsabancibulvari.jpeg",
+    distanceKm: 1.5,
+    durationMin: 5,
+    hoverOverlayPng: "/overlays/bilkentsabanci.png",
+  },
+  {
+    id: "road2",
+    name: "21-27. Cadde",
+    categoryId: "road",
+    yaw: -50,
+    pitch: -40,
+    cardImage: "/pins/2127cadde.jpeg",
+    distanceKm: 2.1,
+    durationMin: 6,
+    hoverOverlayPng: "/overlays/2127.cadde.png",
+  },
+  {
+    id: "road3",
+    name: "Ankara Çankaya Mustafa Kemal Mahallesi",
+    categoryId: "road",
+    yaw: -60,
+    pitch: -25,
+    cardImage: "/pins/mustafakemalmahallesi.jpeg",
+    distanceKm: 0.7,
+    durationMin: 3,
+    hoverOverlayPng: "/overlays/mustafakemalmahallesi.png",
+  },
+];
